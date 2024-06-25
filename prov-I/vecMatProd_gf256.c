@@ -22,7 +22,6 @@ along with HP-PROV. If not, see <https://www.gnu.org/licenses/>. */
 #include "params.h"
 #include "multab_gf256.h"
 #include "arith_gf256.h"
-#include "dotProduct_gf256.h"
 #include "prov_gf256.h"
 #include <emmintrin.h>
 #include <tmmintrin.h>
@@ -1289,6 +1288,11 @@ void addVecMatTProd_gf256_pclmul(uint8_t *w, const uint8_t *u,
 #undef NROWS
 #undef NCOLS
 #define NDIM NB_VIN
+#if NDIM&15
+  #define NDIMR (NDIM&15)
+#else
+  #define NDIMR 16
+#endif
 
 /*! \brief Vector-matrix product over GF(256): (1*v)*(v*v)=(1*v).
  \details Multiplication of a vector by the transpose of an upper triangular
@@ -1296,23 +1300,374 @@ void addVecMatTProd_gf256_pclmul(uint8_t *w, const uint8_t *u,
  \param[out] w A vector over GF(256) of size v, equal to u.(B^T).
  \param[in] u A vector over GF(256) of size v.
  \param[in] B An upper triangular matrix over GF(256) of size v*v.
+ \req ceil(v/8)=11.
  \alloc v bytes for u, (v*(v+1))/2 bytes for B, v bytes for w.
  \csttime u, B, w.
 */
 void addVecMatProd_Ut_gf256_pclmul(uint8_t *w, const uint8_t *u,
                                                const uint8_t *B)
 {
+  const __m128i mask_rev64_epi16=_mm_set_epi64x((uint64_t)0x9080b0a0d0c0f0e,
+                                                (uint64_t)0x100030205040706);
+  __m128i e,S,w0,w1,u00,u10,u20,u30,u40,u50,u01,u11,u21,u31,u41,u51,
+          B0,B1,B00,B10,B01,B11,mask_U;
   unsigned int j;
 
-  /* columns of u, rows of B */
-  for(j=0;j<NDIM;++j)
+  B0=_mm_loadu_si128((__m128i*)u);
+  B0=_mm_slli_si128(B0,16-NDIMR);
+  /* 7 6 5 4 3 2 1 0 --> 1 0 3 2 5 4 7 6 */
+  B0=_mm_shuffle_epi8(B0,mask_rev64_epi16);
+  /* even bytes *x^8 */
+  u00=_mm_slli_epi16(B0,8);
+  /* odd bytes */
+  u01=_mm_srli_epi16(B0,8);
+  u+=NDIMR;
+
+  B0=_mm_loadu_si128((__m128i*)u);
+  B1=_mm_loadu_si128((__m128i*)u+1);
+  /* 7 6 5 4 3 2 1 0 --> 1 0 3 2 5 4 7 6 */
+  B0=_mm_shuffle_epi8(B0,mask_rev64_epi16);
+  B1=_mm_shuffle_epi8(B1,mask_rev64_epi16);
+  /* even bytes *x^8 */
+  u10=_mm_slli_epi16(B0,8);
+  u20=_mm_slli_epi16(B1,8);
+  /* odd bytes */
+  u11=_mm_srli_epi16(B0,8);
+  u21=_mm_srli_epi16(B1,8);
+
+  B0=_mm_loadu_si128((__m128i*)u+2);
+  B1=_mm_loadu_si128((__m128i*)u+3);
+  /* 7 6 5 4 3 2 1 0 --> 1 0 3 2 5 4 7 6 */
+  B0=_mm_shuffle_epi8(B0,mask_rev64_epi16);
+  B1=_mm_shuffle_epi8(B1,mask_rev64_epi16);
+  /* even bytes *x^8 */
+  u30=_mm_slli_epi16(B0,8);
+  u40=_mm_slli_epi16(B1,8);
+  /* odd bytes */
+  u31=_mm_srli_epi16(B0,8);
+  u41=_mm_srli_epi16(B1,8);
+
+  B0=_mm_loadu_si128((__m128i*)u+4);
+  /* 7 6 5 4 3 2 1 0 --> 1 0 3 2 5 4 7 6 */
+  B0=_mm_shuffle_epi8(B0,mask_rev64_epi16);
+  /* even bytes *x^8 */
+  u50=_mm_slli_epi16(B0,8);
+  /* odd bytes */
+  u51=_mm_srli_epi16(B0,8);
+
+  B0=_mm_loadu_si128((__m128i*)B);
+  B0=_mm_slli_si128(B0,16-NDIMR);
+  mask_U=_mm_slli_si128(~_mm_setzero_si128(),16-NDIMR);
+  B-=16-NDIMR;
+  for(j=0;j<NDIMR;++j)
   {
-    /* dot product of u and the j-th row of B */
-    w[j]^=dotProduct_gf256_pclmul(u,B,NDIM-j);
-    ++u;
-    B+=NDIM-j;
+    B1=_mm_loadu_si128((__m128i*)B+1);
+
+    B0&=mask_U;
+    mask_U=_mm_slli_si128(mask_U,1);
+
+    /* even bytes *x^8 */
+    B00=_mm_slli_epi16(B0,8);
+    B10=_mm_slli_epi16(B1,8);
+    /* odd bytes */
+    B01=_mm_srli_epi16(B0,8);
+    B11=_mm_srli_epi16(B1,8);
+
+    /* each carry-less multiplication performs a dot product */
+    /* w0 =_mm_clmulepi64_si128(u00,B00,0); */
+    w0 =_mm_clmulepi64_si128(u00,B00,0x11);
+    w0^=_mm_clmulepi64_si128(u10,B10,0);
+    w0^=_mm_clmulepi64_si128(u10,B10,0x11);
+    /* w1 =_mm_clmulepi64_si128(u01,B01,0); */
+    w1 =_mm_clmulepi64_si128(u01,B01,0x11);
+    w1^=_mm_clmulepi64_si128(u11,B11,0);
+    w1^=_mm_clmulepi64_si128(u11,B11,0x11);
+
+    /* repeat the previous process */
+    B0=_mm_loadu_si128((__m128i*)B+2);
+    B1=_mm_loadu_si128((__m128i*)B+3);
+
+    /* even bytes *x^8 */
+    B00=_mm_slli_epi16(B0,8);
+    B10=_mm_slli_epi16(B1,8);
+    /* odd bytes */
+    B01=_mm_srli_epi16(B0,8);
+    B11=_mm_srli_epi16(B1,8);
+
+    /* each carry-less multiplication performs a dot product */
+    w0^=_mm_clmulepi64_si128(u20,B00,0);
+    w0^=_mm_clmulepi64_si128(u20,B00,0x11);
+    w0^=_mm_clmulepi64_si128(u30,B10,0);
+    w0^=_mm_clmulepi64_si128(u30,B10,0x11);
+    w1^=_mm_clmulepi64_si128(u21,B01,0);
+    w1^=_mm_clmulepi64_si128(u21,B01,0x11);
+    w1^=_mm_clmulepi64_si128(u31,B11,0);
+    w1^=_mm_clmulepi64_si128(u31,B11,0x11);
+
+    /* repeat the previous process */
+    B0=_mm_loadu_si128((__m128i*)B+4);
+    B1=_mm_loadu_si128((__m128i*)B+5);
+
+    /* even bytes *x^8 */
+    B00=_mm_slli_epi16(B0,8);
+    B10=_mm_slli_epi16(B1,8);
+    /* odd bytes */
+    B01=_mm_srli_epi16(B0,8);
+    B11=_mm_srli_epi16(B1,8);
+
+    /* each carry-less multiplication performs a dot product */
+    w0^=_mm_clmulepi64_si128(u40,B00,0);
+    w0^=_mm_clmulepi64_si128(u40,B00,0x11);
+    w0^=_mm_clmulepi64_si128(u50,B10,0);
+    w0^=_mm_clmulepi64_si128(u50,B10,0x11);
+    w1^=_mm_clmulepi64_si128(u41,B01,0);
+    w1^=_mm_clmulepi64_si128(u41,B01,0x11);
+    w1^=_mm_clmulepi64_si128(u51,B11,0);
+    w1^=_mm_clmulepi64_si128(u51,B11,0x11);
+
+    e=_mm_srli_si128(w0,8)^_mm_srli_si128(w1,6);
+    REM_CORE_GF256_SSE2(e,S)
+    w[j]^=(uint8_t)_mm_cvtsi128_si32(e);
+
+    B+=NDIM-1-j;
+    B0=_mm_loadu_si128((__m128i*)B);
+  }
+  B+=16;
+
+  mask_U=~_mm_setzero_si128();
+  for(;j<(16+NDIMR);++j)
+  {
+    B0=_mm_loadu_si128((__m128i*)B);
+    B1=_mm_loadu_si128((__m128i*)B+1);
+
+    /* here, mask_U is 0xff...ff<<(8*(j-NDIMR)) */
+    B0&=mask_U;
+    mask_U=_mm_slli_si128(mask_U,1);
+
+    /* even bytes *x^8 */
+    B00=_mm_slli_epi16(B0,8);
+    B10=_mm_slli_epi16(B1,8);
+    /* odd bytes */
+    B01=_mm_srli_epi16(B0,8);
+    B11=_mm_srli_epi16(B1,8);
+
+    /* each carry-less multiplication performs a dot product */
+    w0 =_mm_clmulepi64_si128(u10,B00,0);
+    w0^=_mm_clmulepi64_si128(u10,B00,0x11);
+    w0^=_mm_clmulepi64_si128(u20,B10,0);
+    w0^=_mm_clmulepi64_si128(u20,B10,0x11);
+    w1 =_mm_clmulepi64_si128(u11,B01,0);
+    w1^=_mm_clmulepi64_si128(u11,B01,0x11);
+    w1^=_mm_clmulepi64_si128(u21,B11,0);
+    w1^=_mm_clmulepi64_si128(u21,B11,0x11);
+
+    /* repeat the previous process */
+    B0=_mm_loadu_si128((__m128i*)B+2);
+    B1=_mm_loadu_si128((__m128i*)B+3);
+
+    /* even bytes *x^8 */
+    B00=_mm_slli_epi16(B0,8);
+    B10=_mm_slli_epi16(B1,8);
+    /* odd bytes */
+    B01=_mm_srli_epi16(B0,8);
+    B11=_mm_srli_epi16(B1,8);
+
+    /* each carry-less multiplication performs a dot product */
+    w0^=_mm_clmulepi64_si128(u30,B00,0);
+    w0^=_mm_clmulepi64_si128(u30,B00,0x11);
+    w0^=_mm_clmulepi64_si128(u40,B10,0);
+    w0^=_mm_clmulepi64_si128(u40,B10,0x11);
+    w1^=_mm_clmulepi64_si128(u31,B01,0);
+    w1^=_mm_clmulepi64_si128(u31,B01,0x11);
+    w1^=_mm_clmulepi64_si128(u41,B11,0);
+    w1^=_mm_clmulepi64_si128(u41,B11,0x11);
+
+    /* repeat the previous process */
+    B0=_mm_loadu_si128((__m128i*)B+4);
+
+    /* even bytes *x^8 */
+    B00=_mm_slli_epi16(B0,8);
+    /* odd bytes */
+    B01=_mm_srli_epi16(B0,8);
+
+    /* each carry-less multiplication performs a dot product */
+    w0^=_mm_clmulepi64_si128(u50,B00,0);
+    w0^=_mm_clmulepi64_si128(u50,B00,0x11);
+    w1^=_mm_clmulepi64_si128(u51,B01,0);
+    w1^=_mm_clmulepi64_si128(u51,B01,0x11);
+
+    e=_mm_srli_si128(w0,8)^_mm_srli_si128(w1,6);
+    REM_CORE_GF256_SSE2(e,S)
+    w[j]^=(uint8_t)_mm_cvtsi128_si32(e);
+
+    B+=NDIM-1-j;
+  }
+  B+=16;
+
+  mask_U=~_mm_setzero_si128();
+  for(;j<(32+NDIMR);++j)
+  {
+    B0=_mm_loadu_si128((__m128i*)B);
+    B1=_mm_loadu_si128((__m128i*)B+1);
+
+    B0&=mask_U;
+    mask_U=_mm_slli_si128(mask_U,1);
+
+    /* even bytes *x^8 */
+    B00=_mm_slli_epi16(B0,8);
+    B10=_mm_slli_epi16(B1,8);
+    /* odd bytes */
+    B01=_mm_srli_epi16(B0,8);
+    B11=_mm_srli_epi16(B1,8);
+
+    /* each carry-less multiplication performs a dot product */
+    w0 =_mm_clmulepi64_si128(u20,B00,0);
+    w0^=_mm_clmulepi64_si128(u20,B00,0x11);
+    w0^=_mm_clmulepi64_si128(u30,B10,0);
+    w0^=_mm_clmulepi64_si128(u30,B10,0x11);
+    w1 =_mm_clmulepi64_si128(u21,B01,0);
+    w1^=_mm_clmulepi64_si128(u21,B01,0x11);
+    w1^=_mm_clmulepi64_si128(u31,B11,0);
+    w1^=_mm_clmulepi64_si128(u31,B11,0x11);
+
+    /* repeat the previous process */
+    B0=_mm_loadu_si128((__m128i*)B+2);
+    B1=_mm_loadu_si128((__m128i*)B+3);
+
+    /* even bytes *x^8 */
+    B00=_mm_slli_epi16(B0,8);
+    B10=_mm_slli_epi16(B1,8);
+    /* odd bytes */
+    B01=_mm_srli_epi16(B0,8);
+    B11=_mm_srli_epi16(B1,8);
+
+    /* each carry-less multiplication performs a dot product */
+    w0^=_mm_clmulepi64_si128(u40,B00,0);
+    w0^=_mm_clmulepi64_si128(u40,B00,0x11);
+    w0^=_mm_clmulepi64_si128(u50,B10,0);
+    w0^=_mm_clmulepi64_si128(u50,B10,0x11);
+    w1^=_mm_clmulepi64_si128(u41,B01,0);
+    w1^=_mm_clmulepi64_si128(u41,B01,0x11);
+    w1^=_mm_clmulepi64_si128(u51,B11,0);
+    w1^=_mm_clmulepi64_si128(u51,B11,0x11);
+
+    e=_mm_srli_si128(w0,8)^_mm_srli_si128(w1,6);
+    REM_CORE_GF256_SSE2(e,S)
+    w[j]^=(uint8_t)_mm_cvtsi128_si32(e);
+
+    B+=NDIM-1-j;
+  }
+  B+=16;
+
+  mask_U=~_mm_setzero_si128();
+  for(;j<(48+NDIMR);++j)
+  {
+    B0=_mm_loadu_si128((__m128i*)B);
+    B1=_mm_loadu_si128((__m128i*)B+1);
+
+    B0&=mask_U;
+    mask_U=_mm_slli_si128(mask_U,1);
+
+    /* even bytes *x^8 */
+    B00=_mm_slli_epi16(B0,8);
+    B10=_mm_slli_epi16(B1,8);
+    /* odd bytes */
+    B01=_mm_srli_epi16(B0,8);
+    B11=_mm_srli_epi16(B1,8);
+
+    /* each carry-less multiplication performs a dot product */
+    w0 =_mm_clmulepi64_si128(u30,B00,0);
+    w0^=_mm_clmulepi64_si128(u30,B00,0x11);
+    w0^=_mm_clmulepi64_si128(u40,B10,0);
+    w0^=_mm_clmulepi64_si128(u40,B10,0x11);
+    w1 =_mm_clmulepi64_si128(u31,B01,0);
+    w1^=_mm_clmulepi64_si128(u31,B01,0x11);
+    w1^=_mm_clmulepi64_si128(u41,B11,0);
+    w1^=_mm_clmulepi64_si128(u41,B11,0x11);
+
+    /* repeat the previous process */
+    B0=_mm_loadu_si128((__m128i*)B+2);
+
+    /* even bytes *x^8 */
+    B00=_mm_slli_epi16(B0,8);
+    /* odd bytes */
+    B01=_mm_srli_epi16(B0,8);
+
+    /* each carry-less multiplication performs a dot product */
+    w0^=_mm_clmulepi64_si128(u50,B00,0);
+    w0^=_mm_clmulepi64_si128(u50,B00,0x11);
+    w1^=_mm_clmulepi64_si128(u51,B01,0);
+    w1^=_mm_clmulepi64_si128(u51,B01,0x11);
+
+    e=_mm_srli_si128(w0,8)^_mm_srli_si128(w1,6);
+    REM_CORE_GF256_SSE2(e,S)
+    w[j]^=(uint8_t)_mm_cvtsi128_si32(e);
+
+    B+=NDIM-1-j;
+  }
+  B+=16;
+
+  mask_U=~_mm_setzero_si128();
+  for(;j<(64+NDIMR);++j)
+  {
+    B0=_mm_loadu_si128((__m128i*)B);
+    B1=_mm_loadu_si128((__m128i*)B+1);
+
+    B0&=mask_U;
+    mask_U=_mm_slli_si128(mask_U,1);
+
+    /* even bytes *x^8 */
+    B00=_mm_slli_epi16(B0,8);
+    B10=_mm_slli_epi16(B1,8);
+    /* odd bytes */
+    B01=_mm_srli_epi16(B0,8);
+    B11=_mm_srli_epi16(B1,8);
+
+    /* each carry-less multiplication performs a dot product */
+    w0 =_mm_clmulepi64_si128(u40,B00,0);
+    w0^=_mm_clmulepi64_si128(u40,B00,0x11);
+    w0^=_mm_clmulepi64_si128(u50,B10,0);
+    w0^=_mm_clmulepi64_si128(u50,B10,0x11);
+    w1 =_mm_clmulepi64_si128(u41,B01,0);
+    w1^=_mm_clmulepi64_si128(u41,B01,0x11);
+    w1^=_mm_clmulepi64_si128(u51,B11,0);
+    w1^=_mm_clmulepi64_si128(u51,B11,0x11);
+
+    e=_mm_srli_si128(w0,8)^_mm_srli_si128(w1,6);
+    REM_CORE_GF256_SSE2(e,S)
+    w[j]^=(uint8_t)_mm_cvtsi128_si32(e);
+
+    B+=NDIM-1-j;
+  }
+  B+=16;
+
+  mask_U=~_mm_setzero_si128();
+  for(;j<NDIM;++j)
+  {
+    B0=_mm_loadu_si128((__m128i*)B);
+
+    B0&=mask_U;
+    mask_U=_mm_slli_si128(mask_U,1);
+
+    /* even bytes *x^8 */
+    B00=_mm_slli_epi16(B0,8);
+    /* odd bytes */
+    B01=_mm_srli_epi16(B0,8);
+
+    /* each carry-less multiplication performs a dot product */
+    w0 =_mm_clmulepi64_si128(u50,B00,0);
+    w0^=_mm_clmulepi64_si128(u50,B00,0x11);
+    w1 =_mm_clmulepi64_si128(u51,B01,0);
+    w1^=_mm_clmulepi64_si128(u51,B01,0x11);
+
+    e=_mm_srli_si128(w0,8)^_mm_srli_si128(w1,6);
+    REM_CORE_GF256_SSE2(e,S)
+    w[j]^=(uint8_t)_mm_cvtsi128_si32(e);
+
+    B+=NDIM-1-j;
   }
 }
 
 #undef NDIM
+#undef NDIMR
 
